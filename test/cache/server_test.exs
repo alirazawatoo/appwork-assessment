@@ -1,7 +1,7 @@
 defmodule Cache.ServerTest do
   use ExUnit.Case, async: true
 
-  alias Cache.{Request, Response, Server}
+  alias Cache.{Request, Response, Server, UpstreamError}
 
   defp request(path), do: %Request{method: :get, path: path}
 
@@ -30,7 +30,8 @@ defmodule Cache.ServerTest do
     {upstream, call_count} = Keyword.get_lazy(opts, :upstream_pair, fn -> counting_upstream() end)
     cap = Keyword.fetch!(opts, :cap)
 
-    pid = start_supervised!({Server, cap: cap, upstream: upstream})
+    server_opts = [cap: cap, upstream: upstream] ++ Keyword.take(opts, [:fetch_timeout])
+    pid = start_supervised!({Server, server_opts})
     {pid, call_count}
   end
 
@@ -123,6 +124,15 @@ defmodule Cache.ServerTest do
     assert call_count.() == 1
   end
 
+  test "a response with a zero TTL is returned but never cached" do
+    {upstream, call_count} = counting_upstream(ttl_seconds: 0)
+    {pid, _call_count} = start_cache!(cap: 10, upstream_pair: {upstream, call_count})
+
+    assert %Response{ttl_seconds: 0} = Server.fetch(pid, request("/a"))
+    Server.fetch(pid, request("/a"))
+    assert call_count.() == 2
+  end
+
   test "concurrent identical-miss requests coalesce into a single upstream call" do
     {upstream, call_count} = counting_upstream(delay_ms: 50)
     {pid, _call_count} = start_cache!(cap: 10, upstream_pair: {upstream, call_count})
@@ -146,5 +156,107 @@ defmodule Cache.ServerTest do
 
     assert length(Enum.uniq(results)) == 30
     assert call_count.() == 30
+  end
+
+  test "a killed coalesced caller does not disturb the other waiters" do
+    {upstream, call_count} = counting_upstream(delay_ms: 100)
+    {pid, _call_count} = start_cache!(cap: 10, upstream_pair: {upstream, call_count})
+
+    doomed = spawn(fn -> Server.fetch(pid, request("/shared")) end)
+    survivor = Task.async(fn -> Server.fetch(pid, request("/shared")) end)
+    Process.sleep(20)
+    Process.exit(doomed, :kill)
+
+    assert %Response{body: "/shared"} = Task.await(survivor)
+    assert call_count.() == 1
+    assert Server.fetch(pid, request("/shared")).body == "/shared"
+  end
+
+  test "rejects an upstream that is not a 1-arity function" do
+    assert {:error, {{%ArgumentError{message: message}, _stacktrace}, _child}} =
+             start_supervised({Server, cap: 1, upstream: :nope})
+
+    assert message =~ ":upstream"
+  end
+
+  test "ignores stray messages instead of crashing" do
+    {pid, _call_count} = start_cache!(cap: 10)
+
+    send(pid, :unexpected)
+    send(pid, {make_ref(), :late_reply})
+
+    assert %Response{body: "/a"} = Server.fetch(pid, request("/a"))
+  end
+
+  describe "when the upstream fails" do
+    @describetag capture_log: true
+
+    test "a raise reaches every coalesced caller, and the failure is not cached" do
+      {:ok, calls} = Agent.start_link(fn -> 0 end)
+
+      upstream = fn %Request{} ->
+        Agent.update(calls, &(&1 + 1))
+        Process.sleep(50)
+        raise "upstream exploded"
+      end
+
+      {pid, _} = start_cache!(cap: 10, upstream_pair: {upstream, nil})
+
+      errors =
+        1..5
+        |> Task.async_stream(fn _ -> catch_upstream_error(pid, request("/a")) end,
+          max_concurrency: 5
+        )
+        |> Enum.map(fn {:ok, error} -> error end)
+
+      assert Agent.get(calls, & &1) == 1
+
+      for error <- errors do
+        assert %UpstreamError{reason: {:raised, %RuntimeError{message: "upstream exploded"}}} =
+                 error
+
+        assert Exception.message(error) =~ "upstream exploded"
+      end
+
+      catch_upstream_error(pid, request("/a"))
+      assert Agent.get(calls, & &1) == 2
+    end
+
+    test "a result that is not a valid response is an error, not a crash" do
+      upstream = fn %Request{} -> {:error, :not_found} end
+      {pid, _} = start_cache!(cap: 10, upstream_pair: {upstream, nil})
+
+      assert %UpstreamError{reason: {:invalid_response, {:error, :not_found}}} =
+               catch_upstream_error(pid, request("/a"))
+
+      assert %UpstreamError{reason: {:invalid_response, _}} =
+               catch_upstream_error(pid, request("/a"))
+    end
+
+    test "a slow upstream call is killed after :fetch_timeout" do
+      test_pid = self()
+
+      upstream = fn %Request{} ->
+        send(test_pid, {:upstream_started, self()})
+        Process.sleep(:infinity)
+      end
+
+      {pid, _} = start_cache!(cap: 10, upstream_pair: {upstream, nil}, fetch_timeout: 50)
+
+      {elapsed_us, error} = :timer.tc(fn -> catch_upstream_error(pid, request("/a")) end)
+
+      assert %UpstreamError{reason: :timeout} = error
+      assert elapsed_us < 1_000_000
+      assert_received {:upstream_started, task_pid}
+      refute Process.alive?(task_pid)
+
+      catch_upstream_error(pid, request("/a"))
+      assert_received {:upstream_started, second_task_pid}
+      assert second_task_pid != task_pid
+    end
+  end
+
+  defp catch_upstream_error(pid, request) do
+    assert_raise UpstreamError, fn -> Server.fetch(pid, request) end
   end
 end

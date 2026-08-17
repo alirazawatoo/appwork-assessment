@@ -23,11 +23,29 @@ defmodule Cache.Server do
   including other callers asking for the *same* in-flight request, whose
   calls are coalesced onto the single upstream call already in progress
   instead of triggering a second one.
+
+  ## Options
+
+    * `:cap` (required) - maximum number of cached entries
+    * `:upstream` (required) - a 1-arity `request -> response` function
+    * `:fetch_timeout` - milliseconds an upstream call may take before it
+      is killed, or `:infinity` (default `5000`)
+    * `:task_supervisor` - where upstream calls run (default
+      `Cache.TaskSupervisor`)
+    * `:name` - optional registered name
+
+  ## Failures
+
+  If the upstream call raises, exits, returns anything other than a
+  `Cache.Response`, or exceeds `:fetch_timeout`, every caller waiting on it
+  gets a `Cache.UpstreamError` raised from `fetch/2`. Nothing is cached, so
+  the next fetch tries upstream again. The cache process itself never
+  crashes on upstream misbehaviour.
   """
 
   use GenServer
 
-  alias Cache.{Request, Response}
+  alias Cache.{Request, Response, UpstreamError}
 
   @behaviour Cache
 
@@ -35,6 +53,7 @@ defmodule Cache.Server do
     :cap,
     :upstream,
     :task_supervisor,
+    :fetch_timeout,
     entries: %{},
     order: [],
     size: 0,
@@ -57,7 +76,12 @@ defmodule Cache.Server do
   @impl Cache
   @spec fetch(GenServer.server(), Request.t()) :: struct()
   def fetch(server, %Request{} = request) do
-    GenServer.call(server, {:fetch, request}, :infinity)
+    # The server bounds each upstream call with :fetch_timeout, so the
+    # call itself can wait as long as that takes.
+    case GenServer.call(server, {:fetch, request}, :infinity) do
+      {:ok, response} -> response
+      {:error, reason} -> raise UpstreamError, request: request, reason: reason
+    end
   end
 
   ## Server callbacks
@@ -67,12 +91,30 @@ defmodule Cache.Server do
     cap = Keyword.fetch!(opts, :cap)
     upstream = Keyword.fetch!(opts, :upstream)
     task_supervisor = Keyword.get(opts, :task_supervisor, Cache.TaskSupervisor)
+    fetch_timeout = Keyword.get(opts, :fetch_timeout, 5_000)
 
     if not (is_integer(cap) and cap > 0) do
       raise ArgumentError, "expected :cap to be a positive integer, got: #{inspect(cap)}"
     end
 
-    {:ok, %__MODULE__{cap: cap, upstream: upstream, task_supervisor: task_supervisor}}
+    if not is_function(upstream, 1) do
+      raise ArgumentError,
+            "expected :upstream to be a 1-arity function, got: #{inspect(upstream)}"
+    end
+
+    if not (fetch_timeout == :infinity or (is_integer(fetch_timeout) and fetch_timeout > 0)) do
+      raise ArgumentError,
+            "expected :fetch_timeout to be a positive integer or :infinity, " <>
+              "got: #{inspect(fetch_timeout)}"
+    end
+
+    {:ok,
+     %__MODULE__{
+       cap: cap,
+       upstream: upstream,
+       task_supervisor: task_supervisor,
+       fetch_timeout: fetch_timeout
+     }}
   end
 
   @impl GenServer
@@ -80,7 +122,7 @@ defmodule Cache.Server do
     cond do
       fresh?(state, request) ->
         {response, _expires_at} = Map.fetch!(state.entries, request)
-        {:reply, response, touch(state, request)}
+        {:reply, {:ok, response}, touch(state, request)}
 
       Map.has_key?(state.entries, request) ->
         {:noreply, state |> evict(request) |> start_fetch(request, from)}
@@ -94,45 +136,93 @@ defmodule Cache.Server do
   end
 
   @impl GenServer
-  def handle_info({ref, response}, %__MODULE__{tasks: tasks} = state)
+  def handle_info({ref, result}, %__MODULE__{tasks: tasks} = state)
       when is_map_key(tasks, ref) do
     Process.demonitor(ref, [:flush])
-    {request, tasks} = Map.pop(tasks, ref)
-    {waiters, pending} = Map.pop(state.pending, request)
+    {request, state} = finish_task(state, ref)
 
-    state =
-      %__MODULE__{state | tasks: tasks, pending: pending}
-      |> put_entry(request, response)
+    case result do
+      %Response{ttl_seconds: ttl} = response when is_integer(ttl) and ttl >= 0 ->
+        {waiters, state} = pop_waiters(state, request)
+        Enum.each(waiters, &GenServer.reply(&1, {:ok, response}))
+        {:noreply, put_entry(state, request, response)}
 
-    Enum.each(waiters, &GenServer.reply(&1, response))
-    {:noreply, state}
+      other ->
+        {:noreply, fail_waiters(state, request, {:invalid_response, other})}
+    end
   end
 
   def handle_info({:DOWN, ref, :process, _pid, reason}, %__MODULE__{tasks: tasks} = state)
       when is_map_key(tasks, ref) do
-    {request, tasks} = Map.pop(tasks, ref)
-    {waiters, pending} = Map.pop(state.pending, request)
-
-    Enum.each(waiters, &GenServer.reply(&1, {:error, {:upstream_failed, reason}}))
-    {:noreply, %__MODULE__{state | tasks: tasks, pending: pending}}
+    {request, state} = finish_task(state, ref)
+    {:noreply, fail_waiters(state, request, exit_reason(reason))}
   end
+
+  def handle_info({:fetch_timeout, ref}, %__MODULE__{tasks: tasks} = state)
+      when is_map_key(tasks, ref) do
+    %{pid: pid} = Map.fetch!(tasks, ref)
+    Process.demonitor(ref, [:flush])
+    Task.Supervisor.terminate_child(state.task_supervisor, pid)
+    {request, state} = finish_task(state, ref)
+    {:noreply, fail_waiters(state, request, :timeout)}
+  end
+
+  # Late task replies or timers for a task that already finished, plus any
+  # message sent to the cache by mistake: none of them may crash it.
+  def handle_info(_message, state), do: {:noreply, state}
 
   ## Internal helpers
 
   defp start_fetch(state, request, from) do
-    %Task{ref: ref} =
-      Task.Supervisor.async_nolink(state.task_supervisor, fn -> state.upstream.(request) end)
+    upstream = state.upstream
+
+    %Task{ref: ref, pid: pid} =
+      Task.Supervisor.async_nolink(state.task_supervisor, fn -> upstream.(request) end)
+
+    timer =
+      if state.fetch_timeout != :infinity,
+        do: Process.send_after(self(), {:fetch_timeout, ref}, state.fetch_timeout)
+
+    task = %{request: request, pid: pid, timer: timer}
 
     state
-    |> Map.update!(:tasks, &Map.put(&1, ref, request))
+    |> Map.update!(:tasks, &Map.put(&1, ref, task))
     |> Map.update!(:pending, &Map.put(&1, request, [from]))
   end
+
+  defp finish_task(%__MODULE__{} = state, ref) do
+    {%{request: request, timer: timer}, tasks} = Map.pop(state.tasks, ref)
+    if timer, do: Process.cancel_timer(timer)
+    {request, %__MODULE__{state | tasks: tasks}}
+  end
+
+  defp pop_waiters(%__MODULE__{} = state, request) do
+    {waiters, pending} = Map.pop(state.pending, request, [])
+    {waiters, %__MODULE__{state | pending: pending}}
+  end
+
+  defp fail_waiters(%__MODULE__{} = state, request, reason) do
+    {waiters, state} = pop_waiters(state, request)
+    Enum.each(waiters, &GenServer.reply(&1, {:error, reason}))
+    state
+  end
+
+  defp exit_reason({exception, stacktrace}) when is_exception(exception) and is_list(stacktrace),
+    do: {:raised, exception}
+
+  defp exit_reason({{:nocatch, value}, stacktrace}) when is_list(stacktrace),
+    do: {:exit, {:throw, value}}
+
+  defp exit_reason(reason), do: {:exit, reason}
 
   defp add_waiter(state, request, from) do
     Map.update!(state, :pending, fn pending ->
       Map.update!(pending, request, &[from | &1])
     end)
   end
+
+  # A zero TTL means "valid for this reply only": hand it out, don't store it.
+  defp put_entry(state, _request, %Response{ttl_seconds: 0}), do: state
 
   defp put_entry(%__MODULE__{} = state, request, response) do
     expires_at = now_ms() + :timer.seconds(Response.ttl(response))

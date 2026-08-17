@@ -19,6 +19,13 @@ defmodule Cache.ServerTest do
     {upstream, fn -> Agent.get(counter, & &1) end}
   end
 
+  defp wait_until_late_in_second(min_ms) do
+    if Integer.mod(System.monotonic_time(:millisecond), 1000) < min_ms do
+      Process.sleep(10)
+      wait_until_late_in_second(min_ms)
+    end
+  end
+
   defp start_cache!(opts) do
     {upstream, call_count} = Keyword.get_lazy(opts, :upstream_pair, fn -> counting_upstream() end)
     cap = Keyword.fetch!(opts, :cap)
@@ -101,6 +108,19 @@ defmodule Cache.ServerTest do
 
     Server.fetch(pid, request("/a"))
     assert call_count.() == 2
+  end
+
+  test "an entry cached just before a second boundary keeps its full TTL" do
+    {upstream, call_count} = counting_upstream(ttl_seconds: 1)
+    {pid, _call_count} = start_cache!(cap: 10, upstream_pair: {upstream, call_count})
+
+    wait_until_late_in_second(800)
+    Server.fetch(pid, request("/a"))
+    Process.sleep(300)
+
+    # 300 ms into a 1 s TTL, but already past the next whole second.
+    Server.fetch(pid, request("/a"))
+    assert call_count.() == 1
   end
 
   test "concurrent identical-miss requests coalesce into a single upstream call" do

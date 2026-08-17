@@ -135,7 +135,7 @@ defmodule Cache.Server do
   end
 
   defp put_entry(%__MODULE__{} = state, request, response) do
-    expires_at = System.monotonic_time(:second) + Response.ttl(response)
+    expires_at = now_ms() + :timer.seconds(Response.ttl(response))
     entries = Map.put(state.entries, request, {response, expires_at})
     order = [request | state.order]
     size = state.size + 1
@@ -169,8 +169,12 @@ defmodule Cache.Server do
 
   defp fresh?(%__MODULE__{} = state, request) do
     case Map.fetch(state.entries, request) do
-      {:ok, {_response, expires_at}} -> System.monotonic_time(:second) < expires_at
+      {:ok, {_response, expires_at}} -> now_ms() < expires_at
       :error -> false
     end
   end
+
+  # Whole-second monotonic time would truncate the insert instant, so an
+  # entry cached late in a second could expire up to a second early.
+  defp now_ms, do: System.monotonic_time(:millisecond)
 end

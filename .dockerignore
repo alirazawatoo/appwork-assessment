@@ -1,0 +1,10 @@
+_build/
+deps/
+cover/
+doc/
+tmp/
+.elixir_ls/
+.env
+.env.*
+*.log
+.DS_Store

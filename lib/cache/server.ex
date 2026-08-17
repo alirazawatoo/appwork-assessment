@@ -225,23 +225,48 @@ defmodule Cache.Server do
   defp put_entry(state, _request, %Response{ttl_seconds: 0}), do: state
 
   defp put_entry(%__MODULE__{} = state, request, response) do
-    expires_at = now_ms() + :timer.seconds(Response.ttl(response))
-    entries = Map.put(state.entries, request, {response, expires_at})
-    order = [request | state.order]
-    size = state.size + 1
+    now = now_ms()
+    expires_at = now + :timer.seconds(Response.ttl(response))
 
-    if size > state.cap do
-      {least_recently_used, order} = List.pop_at(order, -1)
+    state = %__MODULE__{
+      state
+      | entries: Map.put(state.entries, request, {response, expires_at}),
+        order: [request | state.order],
+        size: state.size + 1
+    }
 
-      %__MODULE__{
-        state
-        | entries: Map.delete(entries, least_recently_used),
-          order: order,
-          size: size - 1
-      }
+    if state.size > state.cap do
+      state |> drop_expired(now) |> drop_lru_over_cap()
     else
-      %__MODULE__{state | entries: entries, order: order, size: size}
+      state
     end
+  end
+
+  # Expired entries are only removed lazily on lookup, so they can still
+  # hold slots. Reclaim those first rather than evicting a live entry.
+  defp drop_expired(%__MODULE__{entries: entries} = state, now) do
+    {expired, live} =
+      Enum.split_with(state.order, fn key -> elem(Map.fetch!(entries, key), 1) <= now end)
+
+    %__MODULE__{
+      state
+      | entries: Map.drop(entries, expired),
+        order: live,
+        size: state.size - length(expired)
+    }
+  end
+
+  defp drop_lru_over_cap(%__MODULE__{size: size, cap: cap} = state) when size <= cap, do: state
+
+  defp drop_lru_over_cap(%__MODULE__{} = state) do
+    {least_recently_used, order} = List.pop_at(state.order, -1)
+
+    %__MODULE__{
+      state
+      | entries: Map.delete(state.entries, least_recently_used),
+        order: order,
+        size: state.size - 1
+    }
   end
 
   defp touch(%__MODULE__{} = state, request) do

@@ -111,6 +111,29 @@ defmodule Cache.ServerTest do
     assert call_count.() == 2
   end
 
+  test "an insert over cap drops expired entries before evicting live ones" do
+    {:ok, calls} = Agent.start_link(fn -> 0 end)
+
+    upstream = fn %Request{path: path} ->
+      Agent.update(calls, &(&1 + 1))
+      ttl_seconds = if path == "/short", do: 1, else: 60
+      %Response{status: 200, body: path, ttl_seconds: ttl_seconds}
+    end
+
+    {pid, _} = start_cache!(cap: 2, upstream_pair: {upstream, nil})
+
+    Server.fetch(pid, request("/a"))
+    Server.fetch(pid, request("/short"))
+    Process.sleep(1_050)
+
+    # "/a" is least recently used but still valid; "/short" has expired.
+    Server.fetch(pid, request("/b"))
+    assert Agent.get(calls, & &1) == 3
+
+    Server.fetch(pid, request("/a"))
+    assert Agent.get(calls, & &1) == 3
+  end
+
   test "an entry cached just before a second boundary keeps its full TTL" do
     {upstream, call_count} = counting_upstream(ttl_seconds: 1)
     {pid, _call_count} = start_cache!(cap: 10, upstream_pair: {upstream, call_count})

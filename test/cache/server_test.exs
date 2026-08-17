@@ -7,12 +7,13 @@ defmodule Cache.ServerTest do
 
   defp counting_upstream(opts \\ []) do
     delay_ms = Keyword.get(opts, :delay_ms, 0)
+    ttl_seconds = Keyword.get(opts, :ttl_seconds, 60)
     {:ok, counter} = Agent.start_link(fn -> 0 end)
 
     upstream = fn %Request{} = req ->
       Agent.update(counter, &(&1 + 1))
       if delay_ms > 0, do: Process.sleep(delay_ms)
-      %Response{status: 200, body: req.path}
+      %Response{status: 200, body: req.path, ttl_seconds: ttl_seconds}
     end
 
     {upstream, fn -> Agent.get(counter, & &1) end}
@@ -80,6 +81,28 @@ defmodule Cache.ServerTest do
     assert call_count.() == 4
   end
 
+  test "an entry with a still-valid TTL is served from cache without recalling upstream" do
+    {upstream, call_count} = counting_upstream(ttl_seconds: 60)
+    {pid, _call_count} = start_cache!(cap: 10, upstream_pair: {upstream, call_count})
+
+    Server.fetch(pid, request("/a"))
+    Server.fetch(pid, request("/a"))
+    assert call_count.() == 1
+  end
+
+  test "an expired entry is treated as a miss and refetched from upstream" do
+    {upstream, call_count} = counting_upstream(ttl_seconds: 1)
+    {pid, _call_count} = start_cache!(cap: 10, upstream_pair: {upstream, call_count})
+
+    Server.fetch(pid, request("/a"))
+    assert call_count.() == 1
+
+    Process.sleep(1_100)
+
+    Server.fetch(pid, request("/a"))
+    assert call_count.() == 2
+  end
+
   test "concurrent identical-miss requests coalesce into a single upstream call" do
     {upstream, call_count} = counting_upstream(delay_ms: 50)
     {pid, _call_count} = start_cache!(cap: 10, upstream_pair: {upstream, call_count})
@@ -89,7 +112,7 @@ defmodule Cache.ServerTest do
       |> Task.async_stream(fn _ -> Server.fetch(pid, request("/shared")) end, timeout: :infinity)
       |> Enum.map(fn {:ok, result} -> result end)
 
-    assert Enum.uniq(results) == [%Response{status: 200, body: "/shared"}]
+    assert Enum.uniq(results) == [%Response{status: 200, body: "/shared", ttl_seconds: 60}]
     assert call_count.() == 1
   end
 

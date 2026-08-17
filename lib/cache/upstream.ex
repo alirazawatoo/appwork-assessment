@@ -10,10 +10,16 @@ defmodule Cache.Upstream do
   alias Cache.{Request, Response}
 
   @latency_ms 100
+  @ttl_seconds 60
 
   @spec fetch(Request.t()) :: Response.t()
   def fetch(%Request{} = request) do
     Process.sleep(@latency_ms)
-    %Response{status: 200, body: "response for request hash #{Request.hash(request)}"}
+
+    %Response{
+      status: 200,
+      body: "response for request hash #{Request.hash(request)}",
+      ttl_seconds: @ttl_seconds
+    }
   end
 end

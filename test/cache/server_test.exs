@@ -48,12 +48,35 @@ defmodule Cache.ServerTest do
     Server.fetch(pid, request("/c"))
     assert call_count.() == 3
 
-    # "/a" was the oldest and should have been evicted -> refetches from upstream.
+    # "/a" was the least recently used and should have been evicted -> refetches from upstream.
     Server.fetch(pid, request("/a"))
     assert call_count.() == 4
 
-    # "/b" and "/c" are still within the cap and should still be cached.
+    # "/c" was accessed more recently than "/b" and should still be cached.
     Server.fetch(pid, request("/c"))
+    assert call_count.() == 4
+  end
+
+  test "recently accessed entries survive eviction over untouched ones (true LRU)" do
+    {pid, call_count} = start_cache!(cap: 2)
+
+    Server.fetch(pid, request("/a"))
+    Server.fetch(pid, request("/b"))
+    assert call_count.() == 2
+
+    # touch "/a" so it becomes the most-recently-used entry.
+    Server.fetch(pid, request("/a"))
+    assert call_count.() == 2
+
+    # inserting a third distinct request evicts the least-recently-used
+    # entry, which is now "/b" (untouched since insertion), not "/a".
+    Server.fetch(pid, request("/c"))
+    assert call_count.() == 3
+
+    Server.fetch(pid, request("/a"))
+    assert call_count.() == 3
+
+    Server.fetch(pid, request("/b"))
     assert call_count.() == 4
   end
 

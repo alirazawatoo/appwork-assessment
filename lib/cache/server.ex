@@ -2,9 +2,16 @@ defmodule Cache.Server do
   @moduledoc """
   A GenServer-backed cache that wraps a slow upstream `fetch/1`.
 
-  V1: capped capacity, FIFO eviction — the cache stores responses for at
-  least the last `:cap` requests and evicts the oldest entry once that cap
-  is exceeded.
+  V2: capped capacity, true LRU eviction — the entries kept are the `:cap`
+  most *recently used* distinct requests. A cache hit "touches" its entry,
+  moving it to the most-recently-used end of `order`, so eviction drops the
+  least-recently-used entry rather than simply the oldest-inserted one.
+
+  `order` is a plain list (MRU-first) rather than a proper O(1) structure
+  (e.g. a doubly-linked list), so touching/evicting is O(n) in the cap size.
+  That's an intentional, documented tradeoff for this stage — V4 of the
+  exercise (amortized O(1), out of scope here) is exactly where this would
+  be replaced.
 
   Cache hits are answered directly from in-memory state inside
   `handle_call/3`. Cache misses are fetched asynchronously via a supervised
@@ -25,7 +32,7 @@ defmodule Cache.Server do
     :upstream,
     :task_supervisor,
     entries: %{},
-    order: :queue.new(),
+    order: [],
     size: 0,
     tasks: %{},
     pending: %{}
@@ -68,7 +75,7 @@ defmodule Cache.Server do
   def handle_call({:fetch, request}, from, state) do
     cond do
       Map.has_key?(state.entries, request) ->
-        {:reply, Map.fetch!(state.entries, request), state}
+        {:reply, Map.fetch!(state.entries, request), touch(state, request)}
 
       Map.has_key?(state.pending, request) ->
         {:noreply, add_waiter(state, request, from)}
@@ -121,14 +128,24 @@ defmodule Cache.Server do
 
   defp put_entry(%__MODULE__{} = state, request, response) do
     entries = Map.put(state.entries, request, response)
-    order = :queue.in(request, state.order)
+    order = [request | state.order]
     size = state.size + 1
 
     if size > state.cap do
-      {{:value, oldest}, order} = :queue.out(order)
-      %__MODULE__{state | entries: Map.delete(entries, oldest), order: order, size: size - 1}
+      {least_recently_used, order} = List.pop_at(order, -1)
+
+      %__MODULE__{
+        state
+        | entries: Map.delete(entries, least_recently_used),
+          order: order,
+          size: size - 1
+      }
     else
       %__MODULE__{state | entries: entries, order: order, size: size}
     end
+  end
+
+  defp touch(%__MODULE__{} = state, request) do
+    %__MODULE__{state | order: [request | List.delete(state.order, request)]}
   end
 end

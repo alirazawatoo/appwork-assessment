@@ -2,10 +2,14 @@ defmodule Cache.Server do
   @moduledoc """
   A GenServer-backed cache that wraps a slow upstream `fetch/1`.
 
-  V2: capped capacity, true LRU eviction — the entries kept are the `:cap`
-  most *recently used* distinct requests. A cache hit "touches" its entry,
-  moving it to the most-recently-used end of `order`, so eviction drops the
-  least-recently-used entry rather than simply the oldest-inserted one.
+  V3: capped capacity, true LRU eviction, plus TTL — the entries kept are
+  the `:cap` most *recently used* distinct requests, each valid only until
+  its response's TTL (`Cache.Response.ttl/1`) elapses. A cache hit whose
+  entry has expired is treated exactly like a miss: the stale entry is
+  evicted and the request is re-fetched from upstream. A cache hit that is
+  still valid "touches" its entry, moving it to the most-recently-used end
+  of `order`, so eviction (once over capacity) drops the least-recently-used
+  entry rather than simply the oldest-inserted one.
 
   `order` is a plain list (MRU-first) rather than a proper O(1) structure
   (e.g. a doubly-linked list), so touching/evicting is O(n) in the cap size.
@@ -23,7 +27,7 @@ defmodule Cache.Server do
 
   use GenServer
 
-  alias Cache.Request
+  alias Cache.{Request, Response}
 
   @behaviour Cache
 
@@ -74,8 +78,12 @@ defmodule Cache.Server do
   @impl GenServer
   def handle_call({:fetch, request}, from, state) do
     cond do
+      fresh?(state, request) ->
+        {response, _expires_at} = Map.fetch!(state.entries, request)
+        {:reply, response, touch(state, request)}
+
       Map.has_key?(state.entries, request) ->
-        {:reply, Map.fetch!(state.entries, request), touch(state, request)}
+        {:noreply, state |> evict(request) |> start_fetch(request, from)}
 
       Map.has_key?(state.pending, request) ->
         {:noreply, add_waiter(state, request, from)}
@@ -127,7 +135,8 @@ defmodule Cache.Server do
   end
 
   defp put_entry(%__MODULE__{} = state, request, response) do
-    entries = Map.put(state.entries, request, response)
+    expires_at = System.monotonic_time(:second) + Response.ttl(response)
+    entries = Map.put(state.entries, request, {response, expires_at})
     order = [request | state.order]
     size = state.size + 1
 
@@ -147,5 +156,21 @@ defmodule Cache.Server do
 
   defp touch(%__MODULE__{} = state, request) do
     %__MODULE__{state | order: [request | List.delete(state.order, request)]}
+  end
+
+  defp evict(%__MODULE__{} = state, request) do
+    %__MODULE__{
+      state
+      | entries: Map.delete(state.entries, request),
+        order: List.delete(state.order, request),
+        size: state.size - 1
+    }
+  end
+
+  defp fresh?(%__MODULE__{} = state, request) do
+    case Map.fetch(state.entries, request) do
+      {:ok, {_response, expires_at}} -> System.monotonic_time(:second) < expires_at
+      :error -> false
+    end
   end
 end

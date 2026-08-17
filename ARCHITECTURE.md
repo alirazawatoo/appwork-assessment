@@ -19,6 +19,7 @@ classDiagram
         -cap : integer
         -upstream : function
         -task_supervisor : atom
+        -fetch_timeout : timeout
         -entries : map
         -order : list
         -size : integer
@@ -46,6 +47,12 @@ classDiagram
         +fetch(request) response
     }
 
+    class CacheUpstreamError {
+        <<exception>>
+        +request : request
+        +reason : term
+    }
+
     class TaskSupervisor {
         <<OTP Task.Supervisor>>
     }
@@ -55,6 +62,7 @@ classDiagram
     CacheServer --> CacheResponse : stores (with expires_at)
     CacheServer --> TaskSupervisor : spawns fetch Task via
     CacheServer ..> CacheUpstream : default upstream fun
+    CacheServer ..> CacheUpstreamError : raises in callers on failure
 ```
 
 `Cache.Server` is the only stateful piece. It implements the minimal `Cache` behaviour
@@ -139,17 +147,34 @@ is a base assumption, not a V4-only concern. So on a miss, `Cache.Server`:
 4. When the `Task` finishes, it messages the GenServer (`handle_info/2`), which stores the
    result and replies to every waiter via `GenServer.reply/2`.
 
+**Failures.** Each miss task also gets a `{:fetch_timeout, ref}` timer (default 5 s). Whatever
+ends the task first decides the outcome for all its waiters:
+
+| Event | Waiters get | Cached? |
+|---|---|---|
+| `{ref, %Cache.Response{}}` | `{:ok, response}` | yes, unless `ttl_seconds` is 0 |
+| `{ref, other}` | `{:error, {:invalid_response, other}}` | no |
+| `{:DOWN, ref, ...}` (raise, exit, throw) | `{:error, {:raised, e}}` or `{:error, {:exit, r}}` | no |
+| `{:fetch_timeout, ref}` | `{:error, :timeout}`; the task is terminated | no |
+
+`fetch/2` unwraps `{:ok, response}` and raises `Cache.UpstreamError` for `{:error, reason}`, so
+each caller sees the failure in its own process, just as a direct upstream call would. A
+catch-all `handle_info/2` clause drops late replies, cancelled timers and stray messages, so
+none of them can crash the cache.
+
 **Eviction — LRU.** `order` is a plain list, most-recently-used first. A cache hit "touches"
 its entry (removes it from its current position, pushes it to the MRU end); a fresh insert
-does the same. Once `size > cap`, the entry at the LRU end is evicted. This is `O(n)` in `cap`
+does the same. Once `size > cap`, entries whose TTL has already passed are dropped first, and
+only if that is not enough is the entry at the LRU end evicted. This is `O(n)` in `cap`
 — an intentional, documented tradeoff for V1–V3. The exercise's V4 (amortized O(1)
 end-to-end) is exactly where this would be replaced by an ETS-backed doubly-linked list, with
 `Cache.Server` still owning all writes serially for correctness but reads hitting ETS directly
 instead of round-tripping through the GenServer mailbox.
 
 **Expiry — TTL.** Each entry stores `expires_at`, computed as
-`System.monotonic_time(:second) + Cache.Response.ttl(response)` at insert time (monotonic, so
-immune to wall-clock adjustments). A hit on an expired entry is treated exactly like a miss:
+`System.monotonic_time(:millisecond) + ttl_seconds * 1000` at insert time (monotonic, so
+immune to wall-clock adjustments; milliseconds, so an entry inserted late in a second is not
+cut short). A hit on an expired entry is treated exactly like a miss:
 the stale entry is evicted and the request re-enters the same async-fetch/coalescing path as a
 first-time miss.
 
@@ -159,9 +184,10 @@ first-time miss.
 |---|---|
 | `cap` | Maximum number of distinct entries before LRU eviction kicks in. |
 | `upstream` | 1-arity `request -> response` function — the thing being cached in front of. |
+| `fetch_timeout` | Milliseconds (or `:infinity`) an upstream call may run before it is killed and its waiters fail with `:timeout`. |
 | `task_supervisor` | Where miss-handling Tasks are spawned, so a crashed upstream call can't take the cache down with it. |
 | `entries` | `request => {response, expires_at}` — the actual cache, keyed by the request struct itself. |
 | `order` | MRU-first list of keys, used for LRU eviction. `O(n)` touch/evict (see note above). |
 | `size` | Current entry count, tracked alongside `entries` to avoid a `map_size/1` call per write. |
-| `tasks` | `task_ref => request` — lets `handle_info/2` know which request a finished Task belongs to. |
+| `tasks` | `task_ref => %{request, pid, timer}` — lets `handle_info/2` map a finished or timed-out Task back to its request, kill it, and cancel its timer. |
 | `pending` | `request => [from, ...]` — waiters for an in-flight miss; this is the coalescing mechanism. |

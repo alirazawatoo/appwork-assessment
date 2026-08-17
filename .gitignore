@@ -22,3 +22,6 @@ erl_crash.dump
 # Ignore package tarball (built via "mix hex.build").
 cache-*.tar
 
+# Local-only reference material — kept on disk, not versioned.
+/docs/
+

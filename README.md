@@ -31,6 +31,33 @@ Cache.Server.fetch(pid, req) # first call: ~100ms, hits the fake upstream
 Cache.Server.fetch(pid, req) # second call: instant, served from cache
 ```
 
+## Coalesced miss flow
+
+Concurrent callers for the same missing key share one supervised upstream task instead of
+creating a cache stampede:
+
+```mermaid
+sequenceDiagram
+    participant A as Caller A
+    participant B as Caller B
+    participant C as Cache.Server
+    participant T as Supervised task
+    participant U as Slow upstream
+    A->>C: fetch(request)
+    C->>T: start one miss task
+    T->>U: fetch(request)
+    B->>C: fetch(same request)
+    C-->>B: register as waiter
+    U-->>T: response
+    T-->>C: response
+    C-->>A: reply
+    C-->>B: reply
+```
+
+The server remains responsive because the upstream call runs outside the `GenServer`. Requests
+for different keys can progress independently, while callers for the same key wait on the same
+in-flight result.
+
 ## Project structure
 
 ```
@@ -61,7 +88,7 @@ test/
 
 ## Test coverage
 
-`test/cache/server_test.exs` (8 tests) verifies:
+`test/cache/server_test.exs` contains 8 tests covering:
 
 - A miss calls upstream and returns its response; a repeated identical request is served from
   cache without a second upstream call.
@@ -72,6 +99,15 @@ test/
   refetched.
 - Concurrent identical-miss requests coalesce onto a single upstream call (no cache stampede).
 - Concurrent fetches for different requests all resolve correctly and independently.
+
+The test source was reviewed during the portfolio pass but was not executed in that environment.
+
+## Complexity boundary
+
+The implementation intentionally keeps recency in a list, making touch and eviction operations
+O(n). That is appropriate for this exercise's staged V1–V3 design and keeps the behavior easy to
+inspect. A production cache with large capacity would need a different index/ordering structure
+before claiming O(1) lookup and recency updates.
 
 ## Git history
 
